@@ -1,4 +1,4 @@
-{ XSLParser v1.0 - a lightweight, one-unit, (cross-)platform XSL reader
+{ XSLParser v1.0 - a lightweight, one-unit XSL reader
   for Delphi 10+ by Grzegorz Molenda
   https://github.com/gmnevton/XSLParser
 
@@ -26,6 +26,7 @@ interface
 uses
   SysUtils,
   Classes,
+  RTLConsts,
   XML.VerySimple;
 
 type
@@ -122,15 +123,357 @@ type
 
 implementation
 
+{ TXMLStreamReader }
+
+constructor TXMLStreamReader.Create(Stream: TStream);
+begin
+  Create(Stream, TEncoding.UTF8, True);
+end;
+
+constructor TXMLStreamReader.Create(Stream: TStream; DetectBOM: Boolean);
+begin
+  Create(Stream, TEncoding.UTF8, DetectBOM);
+end;
+
+constructor TXMLStreamReader.Create(Stream: TStream; Encoding: TEncoding; DetectBOM: Boolean; BufferSize: Integer);
+begin
+  inherited Create;
+
+  if not Assigned(Stream) then
+    raise EArgumentException.CreateResFmt(@SParamIsNil, ['Stream']); // DO NOT LOCALIZE
+  if not Assigned(Encoding) then
+    raise EArgumentException.CreateResFmt(@SParamIsNil, ['Encoding']); // DO NOT LOCALIZE
+
+  FBufferedData := TStringBuilder.Create;
+  FEncoding := Encoding;
+  FBufferSize := BufferSize;
+  if FBufferSize < 128 then
+    FBufferSize := 128;
+  FNoDataInStream := False;
+  FStream := Stream;
+  FOwnsStream := False;
+  FDetectBOM := DetectBOM;
+  FSkipPreamble := not FDetectBOM;
+end;
+
+constructor TXMLStreamReader.Create(const Filename: string);
+begin
+  Create(TFileStream.Create(Filename, fmOpenRead or fmShareDenyWrite));
+  FOwnsStream := True;
+end;
+
+constructor TXMLStreamReader.Create(const Filename: string; DetectBOM: Boolean);
+begin
+  Create(TFileStream.Create(Filename, fmOpenRead or fmShareDenyWrite), DetectBOM);
+  FOwnsStream := True;
+end;
+
+constructor TXMLStreamReader.Create(const Filename: string; Encoding: TEncoding; DetectBOM: Boolean; BufferSize: Integer);
+begin
+  Create(TFileStream.Create(Filename, fmOpenRead or fmShareDenyWrite), Encoding, DetectBOM, BufferSize);
+  FOwnsStream := True;
+end;
+
+destructor TXMLStreamReader.Destroy;
+begin
+  Close;
+  inherited;
+end;
+
+procedure TXMLStreamReader.Close;
+begin
+  if (FStream <> Nil) and FOwnsStream then begin
+    FStream.Free;
+    FStream := Nil;
+  end;
+
+  if FBufferedData <> Nil then begin
+    FBufferedData.Free;
+    FBufferedData := Nil;
+  end;
+end;
+
+function TXMLStreamReader.DetectBOM(var Encoding: TEncoding; Buffer: TBytes): Integer;
+var
+  LEncoding: TEncoding;
+begin
+  // try to automatically detect the buffer encoding
+  LEncoding := Nil;
+  Result := TEncoding.GetBufferEncoding(Buffer, LEncoding, Nil);
+  if LEncoding <> Nil then
+    Encoding := LEncoding
+  else if Encoding = Nil then
+    Encoding := TEncoding.Default;
+
+  FDetectBOM := False;
+end;
+
+procedure TXMLStreamReader.DiscardBufferedData;
+begin
+  if FBufferedData <> nil then begin
+    FBufferedData.Remove(0, FBufferedData.Length);
+    FNoDataInStream := False;
+  end;
+end;
+
+procedure TXMLStreamReader.FillBuffer(var Encoding: TEncoding);
+const
+  BufferPadding = 4;
+var
+  LString: string;
+  LBuffer: TBytes;
+  BytesRead: Integer;
+  StartIndex: Integer;
+  ByteCount: Integer;
+  ByteBufLen: Integer;
+  ExtraByteCount: Integer;
+
+  procedure AdjustEndOfBuffer(const LBuffer: TBytes; Offset: Integer);
+  var
+    Pos, Size: Integer;
+    Rewind: Integer;
+  begin
+    Dec(Offset);
+    for Pos := Offset downto 0 do
+    begin
+      for Size := Offset - Pos + 1 downto 1 do
+      begin
+        if Encoding.GetCharCount(LBuffer, Pos, Size) > 0 then
+        begin
+          Rewind := Offset - (Pos + Size - 1);
+          FStream.Position := FStream.Position - Rewind;
+          BytesRead := BytesRead - Rewind;
+          Exit;
+        end;
+      end;
+    end;
+  end;
+
+begin
+  SetLength(LBuffer, FBufferSize + BufferPadding);
+
+  // Read data from stream
+  BytesRead := FStream.Read(LBuffer[0], FBufferSize);
+  FNoDataInStream := BytesRead = 0;
+
+  // Check for byte order mark and calc start index for character data
+  if FDetectBOM then
+    StartIndex := DetectBOM(Encoding, LBuffer)
+  else if FSkipPreamble then
+    StartIndex := SkipPreamble(Encoding, LBuffer)
+  else
+    StartIndex := 0;
+
+  // Adjust the end of the buffer to be sure we have a valid encoding
+  if not FNoDataInStream then
+    AdjustEndOfBuffer(LBuffer, BytesRead);
+
+  // Convert to string and calc byte count for the string
+  ByteBufLen := BytesRead - StartIndex;
+  LString := FEncoding.GetString(LBuffer, StartIndex, ByteBufLen);
+  ByteCount := FEncoding.GetByteCount(LString);
+
+  // If byte count <> number of bytes read from the stream
+  // the buffer boundary is mid-character and additional bytes
+  // need to be read from the stream to complete the character
+  ExtraByteCount := 0;
+  while (ByteCount <> ByteBufLen) and (ExtraByteCount < FEncoding.GetMaxByteCount(1)) do
+  begin
+    // Expand buffer if padding is used
+    if (StartIndex + ByteBufLen) = Length(LBuffer) then
+      SetLength(LBuffer, Length(LBuffer) + BufferPadding);
+
+    // Read one more byte from the stream into the
+    // buffer padding and convert to string again
+    BytesRead := FStream.Read(LBuffer[StartIndex + ByteBufLen], 1);
+    if BytesRead = 0 then
+      // End of stream, append what's been read and discard remaining bytes
+      Break;
+
+    Inc(ExtraByteCount);
+
+    Inc(ByteBufLen);
+    LString := FEncoding.GetString(LBuffer, StartIndex, ByteBufLen);
+    ByteCount := FEncoding.GetByteCount(LString);
+  end;
+
+  // Add string to character data buffer
+  FBufferedData.Append(LString);
+end;
+
+function TXMLStreamReader.GetEndOfStream: Boolean;
+begin
+  if not FNoDataInStream and (FBufferedData <> nil) and (FBufferedData.Length < 1) then
+    FillBuffer(FEncoding);
+  Result := FNoDataInStream and ((FBufferedData = nil) or (FBufferedData.Length = 0));
+end;
+
+procedure TXMLStreamReader.OwnStream;
+begin
+  FOwnsStream := True;
+end;
+
+function TXMLStreamReader.Peek: Integer;
+begin
+  Result := -1;
+  if (FBufferedData <> nil) and (not EndOfStream) then
+  begin
+    if FBufferedData.Length < 1 then
+      FillBuffer(FEncoding);
+    Result := Integer(FBufferedData.Chars[0]);
+  end;
+end;
+
+function TXMLStreamReader.Read: Integer;
+begin
+  Result := -1;
+  if (FBufferedData <> nil) and (not EndOfStream) then
+  begin
+    if FBufferedData.Length < 1 then
+      FillBuffer(FEncoding);
+    Result := Integer(FBufferedData.Chars[0]);
+    FBufferedData.Remove(0, 1);
+  end;
+end;
+
+function TXMLStreamReader.Read(var Buffer: TCharArray; Index, Count: Integer): Integer;
+begin
+  Result := -1;
+  if (FBufferedData <> nil) and (not EndOfStream) then
+  begin
+    while (FBufferedData.Length < Count) and (not EndOfStream) and (not FNoDataInStream) do
+      FillBuffer(FEncoding);
+
+    if FBufferedData.Length > Count then
+      Result := Count
+    else
+      Result := FBufferedData.Length;
+
+    FBufferedData.CopyTo(0, Buffer, Index, Result);
+    FBufferedData.Remove(0, Result);
+  end;
+end;
+
+function TXMLStreamReader.ReadBlock(var Buffer: TCharArray; Index, Count: Integer): Integer;
+begin
+  Result := Read(Buffer, Index, Count);
+end;
+
+function TXMLStreamReader.ReadLine: string;
+var
+  NewLineIndex: Integer;
+  PostNewLineIndex: Integer;
+  LChar: Char;
+begin
+  Result := '';
+  if FBufferedData = nil then
+    Exit;
+  NewLineIndex := 0;
+  PostNewLineIndex := 0;
+
+  while True do
+  begin
+    if (NewLineIndex + 2 > FBufferedData.Length) and (not FNoDataInStream) then
+      FillBuffer(FEncoding);
+
+    if NewLineIndex >= FBufferedData.Length then
+    begin
+      if FNoDataInStream then
+      begin
+        PostNewLineIndex := NewLineIndex;
+        Break;
+      end
+      else
+      begin
+        FillBuffer(FEncoding);
+        if FBufferedData.Length = 0 then
+          Break;
+      end;
+    end;
+    LChar := FBufferedData[NewLineIndex];
+    if LChar = #10 then
+    begin
+      PostNewLineIndex := NewLineIndex + 1;
+      Break;
+    end
+    else
+    if (LChar = #13) and (NewLineIndex + 1 < FBufferedData.Length) and (FBufferedData[NewLineIndex + 1] = #10) then
+    begin
+      PostNewLineIndex := NewLineIndex + 2;
+      Break;
+    end
+    else
+    if LChar = #13 then
+    begin
+      PostNewLineIndex := NewLineIndex + 1;
+      Break;
+    end;
+
+    Inc(NewLineIndex);
+  end;
+
+  Result := FBufferedData.ToString;
+  SetLength(Result, NewLineIndex);
+  FBufferedData.Remove(0, PostNewLineIndex);
+end;
+
+function TXMLStreamReader.ReadToEnd: string;
+begin
+  Result := '';
+  if (FBufferedData <> nil) and (not EndOfStream) then
+  begin
+    repeat
+      FillBuffer(FEncoding);
+    until FNoDataInStream;
+    Result := FBufferedData.ToString;
+    FBufferedData.Remove(0, FBufferedData.Length);
+  end;
+end;
+
+procedure TXMLStreamReader.Rewind;
+begin
+  DiscardBufferedData;
+  FSkipPreamble := not FDetectBOM;
+  FStream.Position := 0;
+end;
+
+function TXMLStreamReader.SkipPreamble(Encoding: TEncoding; Buffer: TBytes): Integer;
+var
+  I: Integer;
+  LPreamble: TBytes;
+  BOMPresent: Boolean;
+begin
+  Result := 0;
+  LPreamble := Encoding.GetPreamble;
+  if (Length(LPreamble) > 0) then
+  begin
+    if Length(Buffer) >= Length(LPreamble) then
+    begin
+      BOMPresent := True;
+      for I := 0 to Length(LPreamble) - 1 do
+        if LPreamble[I] <> Buffer[I] then
+        begin
+          BOMPresent := False;
+          Break;
+        end;
+      if BOMPresent then
+        Result := Length(LPreamble);
+    end;
+  end;
+  FSkipPreamble := False;
+end;
+
 { TXSLParser }
 
 constructor TXSLParser.Create;
 begin
   XSL := TXmlVerySimple.Create;
+  FEncoding := 'utf-8';
 end;
 
 destructor TXSLParser.Destroy;
 begin
+  FEncoding := '';
   XSL.Free;
   inherited;
 end;
